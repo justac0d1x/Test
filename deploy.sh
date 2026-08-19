@@ -1,5 +1,5 @@
 #!/bin/bash
-# Скрипт развертывания трёх изолированных контейнеров с SSH-доступом
+# Скрипт развертывания трёх изолированных контейнеров с SSH-доступом (только root)
 # Требует прав root и установленного Docker (устанавливается автоматически для Debian/Ubuntu)
 
 set -e
@@ -31,26 +31,20 @@ BUILD_DIR="/opt/docker-build"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Генерируем случайные пароли для доступа
+# Генерируем общий root-пароль
 PASS_ROOT=$(openssl rand -base64 12)
-PASS_VPN=$(openssl rand -base64 12)
-PASS_SANDBOX1=$(openssl rand -base64 12)
-PASS_SANDBOX2=$(openssl rand -base64 12)
 
-# --- Создание Dockerfile (только SSH) ---
+# --- Создание Dockerfile (без пользователя app) ---
 cat > Dockerfile <<'EOF'
 FROM alpine:latest
 
-# Установка только SSH-сервера
+# Установка SSH-сервера
 RUN apk add --no-cache openssh-server
 
-# Настройка SSH (разрешаем парольный вход и root)
+# Настройка SSH (разрешаем парольный вход для root)
 RUN ssh-keygen -A && \
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-# Создаём пользователя app
-RUN adduser -D -h /home/app -s /bin/bash app
 
 # Копируем скрипт запуска
 COPY entrypoint.sh /entrypoint.sh
@@ -61,12 +55,11 @@ EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-# --- Создание entrypoint.sh ---
+# --- Создание entrypoint.sh (только root) ---
 cat > entrypoint.sh <<'EOF'
 #!/bin/sh
-# Устанавливаем пароли из переменных окружения
+# Устанавливаем пароль для root
 echo "root:${ROOT_PASSWORD}" | chpasswd
-echo "app:${APP_PASSWORD}" | chpasswd
 
 # Запускаем SSH-сервер в foreground
 /usr/sbin/sshd -D
@@ -84,7 +77,6 @@ run_container() {
     local memory=$3
     local disk=$4
     local ssh_port=$5
-    local app_pass=$6
     local data_dir="/opt/${name}-data"
 
     mkdir -p "$data_dir"
@@ -98,11 +90,11 @@ run_container() {
     fi
 
     docker_opts="$docker_opts -v $data_dir:/data -p $ssh_port:22"
-    docker_opts="$docker_opts -e ROOT_PASSWORD=$PASS_ROOT -e APP_PASSWORD=$app_pass"
+    docker_opts="$docker_opts -e ROOT_PASSWORD=$PASS_ROOT"
 
     docker run -d $docker_opts my-ssh
 
-    echo "  Контейнер $name запущен. SSH порт: $ssh_port, пароль для app: $app_pass"
+    echo "  Контейнер $name запущен. SSH порт: $ssh_port"
 }
 
 # --- Удаляем старые контейнеры ---
@@ -117,41 +109,39 @@ done
 # --- Запуск контейнеров ---
 echo -e "${GREEN}Запускаем контейнеры...${NC}"
 
-run_container "vpn"       0.2 1g 1g 2222 "$PASS_VPN"
-run_container "sandbox1"  0.4 2g 3g 2223 "$PASS_SANDBOX1"
-run_container "sandbox2"  0.4 2g 3g 2224 "$PASS_SANDBOX2"
+run_container "vpn"       0.2 1g 1g 2222
+run_container "sandbox1"  0.4 2g 3g 2223
+run_container "sandbox2"  0.4 2g 3g 2224
 
 # --- Определяем внешний IPv4-адрес ---
 IP=$(curl -4 -s ifconfig.me || echo "IP_АДРЕС_ХОСТА")
 
-# --- Сохраняем информацию в файл ---
+# --- Сохраняем информацию в файл (с паролем) ---
 INFO_FILE="/root/container_info.txt"
 cat > "$INFO_FILE" <<EOF
 Дата развертывания: $(date)
 IP-адрес хоста (IPv4): $IP
 
-Доступ по SSH/SFTP (как к отдельным VPS):
-  VPN:       ssh -p 2222 app@$IP    (пароль: $PASS_VPN)
-  Sandbox1:  ssh -p 2223 app@$IP    (пароль: $PASS_SANDBOX1)
-  Sandbox2:  ssh -p 2224 app@$IP    (пароль: $PASS_SANDBOX2)
+Доступ по SSH/SFTP (только root):
+  VPN:       ssh -p 2222 root@$IP    (пароль: $PASS_ROOT)
+  Sandbox1:  ssh -p 2223 root@$IP    (пароль: $PASS_ROOT)
+  Sandbox2:  ssh -p 2224 root@$IP    (пароль: $PASS_ROOT)
 
-Root пароль (одинаков для всех): $PASS_ROOT
-  (для входа как root: ssh -p порт root@$IP)
+Root пароль (общий для всех): $PASS_ROOT
 
 Данные контейнеров хранятся в /opt/<имя>-data
 ==================================================
 EOF
 
+# --- Вывод в консоль (без пароля) ---
 echo -e "\n${GREEN}✅ Развёртывание завершено!${NC}"
 echo "=================================================="
-echo "Доступ по SSH/SFTP (как к отдельным VPS):"
-echo "  VPN:       ssh -p 2222 app@$IP    (пароль: $PASS_VPN)"
-echo "  Sandbox1:  ssh -p 2223 app@$IP    (пароль: $PASS_SANDBOX1)"
-echo "  Sandbox2:  ssh -p 2224 app@$IP    (пароль: $PASS_SANDBOX2)"
+echo "Доступ по SSH/SFTP (только root):"
+echo "  VPN:       ssh -p 2222 root@$IP"
+echo "  Sandbox1:  ssh -p 2223 root@$IP"
+echo "  Sandbox2:  ssh -p 2224 root@$IP"
 echo ""
-echo "Root пароль (одинаков для всех): $PASS_ROOT"
-echo "  (для входа как root: ssh -p порт root@$IP)"
-echo ""
+echo "Root пароль сохранён в файле: $INFO_FILE"
 echo "Данные контейнеров хранятся в /opt/<имя>-data"
 echo "=================================================="
-echo -e "${GREEN}Информация также сохранена в файл: $INFO_FILE${NC}"
+echo -e "${GREEN}Информация сохранена в файл: $INFO_FILE${NC}"
