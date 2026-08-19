@@ -34,12 +34,17 @@ cd "$BUILD_DIR"
 # Генерируем общий root-пароль
 PASS_ROOT=$(openssl rand -base64 12)
 
-# --- Создание Dockerfile (без пользователя app) ---
+# --- Создание Dockerfile (Ubuntu) ---
 cat > Dockerfile <<'EOF'
-FROM alpine:latest
+FROM ubuntu:22.04
 
 # Установка SSH-сервера
-RUN apk add --no-cache openssh-server
+RUN apt-get update && \
+    apt-get install -y openssh-server && \
+    rm -rf /var/lib/apt/lists/*
+
+# Создаём каталог для работы sshd
+RUN mkdir -p /run/sshd
 
 # Настройка SSH (разрешаем парольный вход для root)
 RUN ssh-keygen -A && \
@@ -55,7 +60,7 @@ EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-# --- Создание entrypoint.sh (только root) ---
+# --- Создание entrypoint.sh (без изменений) ---
 cat > entrypoint.sh <<'EOF'
 #!/bin/sh
 # Устанавливаем пароль для root
@@ -123,9 +128,9 @@ cat > "$INFO_FILE" <<EOF
 IP-адрес хоста (IPv4): $IP
 
 Доступ по SSH/SFTP (только root):
-  VPN:       ssh -p 2222 root@$IP    (пароль: $PASS_ROOT)
-  Sandbox1:  ssh -p 2223 root@$IP    (пароль: $PASS_ROOT)
-  Sandbox2:  ssh -p 2224 root@$IP    (пароль: $PASS_ROOT)
+  VPN:       ssh -p 2222 root@$IP
+  Sandbox1:  ssh -p 2223 root@$IP
+  Sandbox2:  ssh -p 2224 root@$IP
 
 Root пароль (общий для всех): $PASS_ROOT
 
@@ -138,8 +143,8 @@ echo -e "\n${GREEN}✅ Развёртывание завершено!${NC}"
 echo "=================================================="
 echo "Доступ по SSH/SFTP (только root):"
 echo "  VPN:       ssh -p 2222 root@$IP"
-echo "  Sandbox1:  ssh -p 2223 root@$IP"
-echo "  Sandbox2:  ssh -p 2224 root@$IP"
+echo "  SandBox1:  ssh -p 2223 root@$IP"
+echo "  SandBox2:  ssh -p 2224 root@$IP"
 echo ""
 echo "Root пароль сохранён в файле: $INFO_FILE"
 echo "Данные контейнеров хранятся в /opt/<имя>-data"
