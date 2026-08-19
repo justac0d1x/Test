@@ -37,11 +37,11 @@ PASS_VPN=$(openssl rand -base64 12)
 PASS_SANDBOX1=$(openssl rand -base64 12)
 PASS_SANDBOX2=$(openssl rand -base64 12)
 
-# --- Создание Dockerfile (без nginx и SSL) ---
+# --- Создание Dockerfile (только SSH) ---
 cat > Dockerfile <<'EOF'
 FROM alpine:latest
 
-# Установка только SSH-сервера и необходимых утилит
+# Установка только SSH-сервера
 RUN apk add --no-cache openssh-server
 
 # Настройка SSH (разрешаем парольный вход и root)
@@ -49,7 +49,7 @@ RUN ssh-keygen -A && \
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Создаём пользователя app (для обычного доступа)
+# Создаём пользователя app
 RUN adduser -D -h /home/app -s /bin/bash app
 
 # Копируем скрипт запуска
@@ -61,7 +61,7 @@ EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-# --- Создание entrypoint.sh (только SSH) ---
+# --- Создание entrypoint.sh ---
 cat > entrypoint.sh <<'EOF'
 #!/bin/sh
 # Устанавливаем пароли из переменных окружения
@@ -89,9 +89,7 @@ run_container() {
 
     mkdir -p "$data_dir"
 
-    # Формируем параметры Docker
     local docker_opts="--name $name --cpus $cpu --memory $memory --memory-swap $memory"
-    # Пытаемся применить ограничение диска, если поддерживается
     if docker run --rm --storage-opt size=${disk} alpine true 2>/dev/null; then
         docker_opts="$docker_opts --storage-opt size=${disk}"
         echo "  Поддержка storage-opt включена (ограничение диска $disk)"
@@ -102,13 +100,12 @@ run_container() {
     docker_opts="$docker_opts -v $data_dir:/data -p $ssh_port:22"
     docker_opts="$docker_opts -e ROOT_PASSWORD=$PASS_ROOT -e APP_PASSWORD=$app_pass"
 
-    # Запускаем контейнер
     docker run -d $docker_opts my-ssh
 
     echo "  Контейнер $name запущен. SSH порт: $ssh_port, пароль для app: $app_pass"
 }
 
-# --- Удаляем старые контейнеры (если есть) ---
+# --- Удаляем старые контейнеры ---
 for c in vpn sandbox1 sandbox2; do
     if docker ps -a --format '{{.Names}}' | grep -q "^$c$"; then
         echo "Останавливаем и удаляем существующий контейнер $c..."
@@ -124,8 +121,27 @@ run_container "vpn"       0.2 1g 1g 2222 "$PASS_VPN"
 run_container "sandbox1"  0.4 2g 3g 2223 "$PASS_SANDBOX1"
 run_container "sandbox2"  0.4 2g 3g 2224 "$PASS_SANDBOX2"
 
-# --- Информация о доступе ---
-IP=$(curl -s ifconfig.me || echo "IP_АДРЕС_ХОСТА")
+# --- Определяем внешний IPv4-адрес ---
+IP=$(curl -4 -s ifconfig.me || echo "IP_АДРЕС_ХОСТА")
+
+# --- Сохраняем информацию в файл ---
+INFO_FILE="/root/container_info.txt"
+cat > "$INFO_FILE" <<EOF
+Дата развертывания: $(date)
+IP-адрес хоста (IPv4): $IP
+
+Доступ по SSH/SFTP (как к отдельным VPS):
+  VPN:       ssh -p 2222 app@$IP    (пароль: $PASS_VPN)
+  Sandbox1:  ssh -p 2223 app@$IP    (пароль: $PASS_SANDBOX1)
+  Sandbox2:  ssh -p 2224 app@$IP    (пароль: $PASS_SANDBOX2)
+
+Root пароль (одинаков для всех): $PASS_ROOT
+  (для входа как root: ssh -p порт root@$IP)
+
+Данные контейнеров хранятся в /opt/<имя>-data
+==================================================
+EOF
+
 echo -e "\n${GREEN}✅ Развёртывание завершено!${NC}"
 echo "=================================================="
 echo "Доступ по SSH/SFTP (как к отдельным VPS):"
@@ -138,3 +154,4 @@ echo "  (для входа как root: ssh -p порт root@$IP)"
 echo ""
 echo "Данные контейнеров хранятся в /opt/<имя>-data"
 echo "=================================================="
+echo -e "${GREEN}Информация также сохранена в файл: $INFO_FILE${NC}"
