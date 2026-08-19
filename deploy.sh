@@ -1,17 +1,16 @@
 #!/bin/bash
 # Скрипт развертывания трёх изолированных контейнеров с SSH-доступом (только root)
-# Требует прав root и установленного Docker (устанавливается автоматически для Debian/Ubuntu)
+# Версия с поддержкой systemd для VPN и исправленными ошибками iptables/ip_forward
 
 set -e
 
-# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 echo -e "${GREEN}Начинаем установку изолированных контейнеров...${NC}"
 
-# Проверка прав
+# Проверка root-прав
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Пожалуйста, запустите скрипт с правами root (sudo)${NC}"
     exit 1
@@ -31,27 +30,33 @@ BUILD_DIR="/opt/docker-build"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Генерируем общий root-пароль
+# Генерация общего пароля root
 PASS_ROOT=$(openssl rand -base64 12)
 
-# --- Создание Dockerfile (Ubuntu) ---
+# --- Dockerfile (Ubuntu + systemd + iptables-legacy + SSH) ---
 cat > Dockerfile <<'EOF'
 FROM ubuntu:22.04
 
-# Установка SSH-сервера
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Установка необходимых пакетов
 RUN apt-get update && \
-    apt-get install -y openssh-server && \
+    apt-get install -y openssh-server systemd systemd-sysv iptables curl wget sudo && \
     rm -rf /var/lib/apt/lists/*
 
-# Создаём каталог для работы sshd
-RUN mkdir -p /run/sshd
-
-# Настройка SSH (разрешаем парольный вход для root)
+# Настройка SSH (разрешаем root-логин с паролем)
 RUN ssh-keygen -A && \
     sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Копируем скрипт запуска
+# Переключение iptables на legacy (для совместимости со старыми скриптами)
+RUN update-alternatives --set iptables /usr/sbin/iptables-legacy || true && \
+    update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true
+
+# Включаем SSH-сервис для systemd (пригодится для VPN-контейнера)
+RUN systemctl enable ssh || true
+
+# Копируем и настраиваем entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
@@ -60,33 +65,41 @@ EXPOSE 22
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-# --- Создание entrypoint.sh (без изменений) ---
+# --- entrypoint.sh (выбор режима: systemd или только sshd) ---
 cat > entrypoint.sh <<'EOF'
-#!/bin/sh
-# Устанавливаем пароль для root
+#!/bin/bash
+# Устанавливаем пароль root из переменной окружения
 echo "root:${ROOT_PASSWORD}" | chpasswd
 
-# Запускаем SSH-сервер в foreground
-/usr/sbin/sshd -D
+if [ "$START_INIT" = "1" ]; then
+    # Запуск systemd как PID 1 (требует --privileged и монтирования /sys/fs/cgroup)
+    exec /sbin/init
+else
+    # Лёгкий режим: только SSH-демон
+    exec /usr/sbin/sshd -D
+fi
 EOF
 chmod +x entrypoint.sh
 
-# --- Сборка образа ---
 echo -e "${GREEN}Сборка образа my-ssh...${NC}"
 docker build -t my-ssh .
 
-# --- Функция запуска контейнера ---
+# --- Функция запуска контейнера с дополнительными опциями ---
 run_container() {
     local name=$1
     local cpu=$2
     local memory=$3
     local disk=$4
     local ssh_port=$5
+    local extra_opts=$6   # дополнительные параметры для docker run
+    local start_init=$7   # 1 – запускать systemd, 0 – только sshd
     local data_dir="/opt/${name}-data"
 
     mkdir -p "$data_dir"
 
     local docker_opts="--name $name --cpus $cpu --memory $memory --memory-swap $memory"
+
+    # Проверяем поддержку storage-opt (ограничение диска)
     if docker run --rm --storage-opt size=${disk} alpine true 2>/dev/null; then
         docker_opts="$docker_opts --storage-opt size=${disk}"
         echo "  Поддержка storage-opt включена (ограничение диска $disk)"
@@ -97,12 +110,18 @@ run_container() {
     docker_opts="$docker_opts -v $data_dir:/data -p $ssh_port:22"
     docker_opts="$docker_opts -e ROOT_PASSWORD=$PASS_ROOT"
 
+    if [ "$start_init" = "1" ]; then
+        docker_opts="$docker_opts -e START_INIT=1"
+    fi
+
+    docker_opts="$docker_opts $extra_opts"
+
     docker run -d $docker_opts my-ssh
 
     echo "  Контейнер $name запущен. SSH порт: $ssh_port"
 }
 
-# --- Удаляем старые контейнеры ---
+# --- Удаляем старые контейнеры (если есть) ---
 for c in vpn sandbox1 sandbox2; do
     if docker ps -a --format '{{.Names}}' | grep -q "^$c$"; then
         echo "Останавливаем и удаляем существующий контейнер $c..."
@@ -111,26 +130,30 @@ for c in vpn sandbox1 sandbox2; do
     fi
 done
 
-# --- Запуск контейнеров ---
 echo -e "${GREEN}Запускаем контейнеры...${NC}"
 
-run_container "vpn"       0.2 1g 1g 2222
-run_container "sandbox1"  0.4 2g 3g 2223
-run_container "sandbox2"  0.4 2g 3g 2224
+# VPN-контейнер – с привилегиями, systemd, включённым форвардингом и cgroup
+run_container "vpn" 0.2 1g 1g 2222 \
+    "--privileged --volume /sys/fs/cgroup:/sys/fs/cgroup:rw --cap-add=ALL --sysctl net.ipv4.ip_forward=1" \
+    1
 
-# --- Определяем внешний IPv4-адрес ---
+# Песочницы – без systemd, обычные права
+run_container "sandbox1" 0.4 2g 3g 2223 "" 0
+run_container "sandbox2" 0.4 2g 3g 2224 "" 0
+
+# Определяем внешний IPv4-адрес
 IP=$(curl -4 -s ifconfig.me || echo "IP_АДРЕС_ХОСТА")
 
-# --- Сохраняем информацию в файл (с паролем) ---
+# --- Сохраняем информацию (с паролем) ---
 INFO_FILE="/root/container_info.txt"
 cat > "$INFO_FILE" <<EOF
 Дата развертывания: $(date)
 IP-адрес хоста (IPv4): $IP
 
 Доступ по SSH/SFTP (только root):
-  VPN:       ssh -p 2222 root@$IP
-  Sandbox1:  ssh -p 2223 root@$IP
-  Sandbox2:  ssh -p 2224 root@$IP
+  VPN:       ssh -p 2222 root@$IP    (пароль: $PASS_ROOT)
+  Sandbox1:  ssh -p 2223 root@$IP    (пароль: $PASS_ROOT)
+  Sandbox2:  ssh -p 2224 root@$IP    (пароль: $PASS_ROOT)
 
 Root пароль (общий для всех): $PASS_ROOT
 
@@ -138,13 +161,13 @@ Root пароль (общий для всех): $PASS_ROOT
 ==================================================
 EOF
 
-# --- Вывод в консоль (без пароля) ---
+# --- Вывод в консоль ---
 echo -e "\n${GREEN}✅ Развёртывание завершено!${NC}"
 echo "=================================================="
 echo "Доступ по SSH/SFTP (только root):"
 echo "  VPN:       ssh -p 2222 root@$IP"
-echo "  SandBox1:  ssh -p 2223 root@$IP"
-echo "  SandBox2:  ssh -p 2224 root@$IP"
+echo "  Sandbox1:  ssh -p 2223 root@$IP"
+echo "  Sandbox2:  ssh -p 2224 root@$IP"
 echo ""
 echo "Root пароль сохранён в файле: $INFO_FILE"
 echo "Данные контейнеров хранятся в /opt/<имя>-data"
